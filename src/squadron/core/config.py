@@ -83,10 +83,11 @@ class MemoryConfig(BaseSettings):
         alias="NEO4J_USER",
         description="Neo4j username",
     )
-    neo4j_password: SecretStr = Field(
-        default=SecretStr("password"),
+    # Security: No default password - must be explicitly configured
+    neo4j_password: SecretStr | None = Field(
+        default=None,
         alias="NEO4J_PASSWORD",
-        description="Neo4j password",
+        description="Neo4j password (required for production)",
     )
     embedding_model: str = Field(
         default="text-embedding-3-small",
@@ -96,6 +97,14 @@ class MemoryConfig(BaseSettings):
         default=1536,
         description="Embedding dimension",
     )
+
+    def validate_credentials(self) -> None:
+        """Validate that required credentials are configured."""
+        if self.neo4j_password is None:
+            raise ValueError(
+                "NEO4J_PASSWORD must be configured. "
+                "Set the NEO4J_PASSWORD environment variable."
+            )
 
 
 class ReasoningConfig(BaseSettings):

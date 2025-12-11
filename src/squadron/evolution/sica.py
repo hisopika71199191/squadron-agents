@@ -564,8 +564,47 @@ Provide ONLY the improved code, no explanation."""
         self,
         agent: Any,
         mutation: Mutation,
+        human_approved: bool = False,
     ) -> Any:
-        """Apply a mutation and return the original value."""
+        """
+        Apply a mutation and return the original value.
+
+        Security: By default, all mutations require human approval before being
+        applied. This prevents automatic execution of potentially malicious
+        LLM-generated code.
+
+        Args:
+            agent: The agent to mutate
+            mutation: The mutation to apply
+            human_approved: Whether a human has reviewed and approved this mutation
+
+        Returns:
+            The original value (for rollback)
+
+        Raises:
+            PermissionError: If human approval is required but not provided
+        """
+        # Security: Require human approval for all mutations by default
+        if not human_approved:
+            logger.warning(
+                "Mutation blocked - human approval required",
+                mutation_type=mutation.mutation_type.value,
+                target=mutation.target_function,
+                diff_preview=mutation.get_diff()[:500] if mutation.original_code else "",
+            )
+            raise PermissionError(
+                f"Human approval required for mutation: {mutation.mutation_type.value} "
+                f"on {mutation.target_function}. Review the mutation diff and call with "
+                f"human_approved=True to proceed.\n\nDiff preview:\n{mutation.get_diff()[:1000]}"
+            )
+
+        logger.info(
+            "Applying approved mutation",
+            mutation_type=mutation.mutation_type.value,
+            target=mutation.target_function,
+            human_approved=human_approved,
+        )
+
         if mutation.mutation_type == MutationType.PROMPT_OPTIMIZATION:
             # Find and update prompt
             reasoner = getattr(agent, "reasoner", None)

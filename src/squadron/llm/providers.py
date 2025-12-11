@@ -7,6 +7,11 @@ Concrete implementations for various LLM providers:
 - Ollama (local models)
 - Hugging Face (transformers, Inference API)
 - OpenAI-compatible APIs (vLLM, LiteLLM, LocalAI, etc.)
+
+Security:
+- API keys are handled as SecretStr to prevent accidental logging
+- TLS warnings for non-HTTPS connections
+- Credentials are never included in repr() or logs
 """
 
 from __future__ import annotations
@@ -14,9 +19,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import warnings
 from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 
 import structlog
+from pydantic import SecretStr
 
 from squadron.llm.base import (
     LLMProvider,
@@ -30,13 +38,38 @@ from squadron.llm.base import (
 logger = structlog.get_logger(__name__)
 
 
+def _warn_insecure_connection(url: str, provider: str) -> None:
+    """Warn about non-HTTPS connections."""
+    if url and not url.startswith("https://") and not url.startswith("http://localhost"):
+        logger.warning(
+            "Insecure HTTP connection to LLM provider",
+            provider=provider,
+            url=url[:50],
+        )
+        warnings.warn(
+            f"Using insecure HTTP connection to {provider}. "
+            "Consider using HTTPS in production.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _get_secret_value(secret: str | SecretStr | None) -> str | None:
+    """Safely extract value from SecretStr or plain string."""
+    if secret is None:
+        return None
+    if isinstance(secret, SecretStr):
+        return secret.get_secret_value()
+    return secret
+
+
 class OpenAIProvider(LLMProvider):
     """OpenAI API provider for GPT-4, GPT-3.5, etc."""
-    
+
     def __init__(
         self,
         model: str = "gpt-4o",
-        api_key: str | None = None,
+        api_key: str | SecretStr | None = None,
         organization: str | None = None,
         base_url: str | None = None,
         temperature: float = 0.7,
@@ -44,19 +77,28 @@ class OpenAIProvider(LLMProvider):
         **kwargs: Any,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
-        self.api_key = api_key
+        # Security: Store API key as SecretStr
+        self._api_key = SecretStr(api_key) if isinstance(api_key, str) else api_key
         self.organization = organization
         self.base_url = base_url
         self._client: Any = None
-    
+
+        # Security: Warn about non-HTTPS connections
+        if base_url:
+            _warn_insecure_connection(base_url, "OpenAI")
+
+    def __repr__(self) -> str:
+        """Safe repr that hides API key."""
+        return f"OpenAIProvider(model={self.model!r}, base_url={self.base_url!r})"
+
     @property
     def provider_name(self) -> str:
         return "openai"
-    
+
     @property
     def supports_vision(self) -> bool:
         return "vision" in self.model or "gpt-4o" in self.model
-    
+
     async def _get_client(self) -> Any:
         if self._client is None:
             try:
@@ -64,7 +106,7 @@ class OpenAIProvider(LLMProvider):
             except ImportError:
                 raise ImportError("openai package required. Run: pip install openai")
             self._client = AsyncOpenAI(
-                api_key=self.api_key,
+                api_key=_get_secret_value(self._api_key),
                 organization=self.organization,
                 base_url=self.base_url,
             )
@@ -163,36 +205,48 @@ class OpenAIProvider(LLMProvider):
 
 class AnthropicProvider(LLMProvider):
     """Anthropic API provider for Claude models."""
-    
+
     def __init__(
         self,
         model: str = "claude-3-5-sonnet-20241022",
-        api_key: str | None = None,
+        api_key: str | SecretStr | None = None,
         base_url: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         **kwargs: Any,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
-        self.api_key = api_key
+        # Security: Store API key as SecretStr
+        self._api_key = SecretStr(api_key) if isinstance(api_key, str) else api_key
         self.base_url = base_url
         self._client: Any = None
-    
+
+        # Security: Warn about non-HTTPS connections
+        if base_url:
+            _warn_insecure_connection(base_url, "Anthropic")
+
+    def __repr__(self) -> str:
+        """Safe repr that hides API key."""
+        return f"AnthropicProvider(model={self.model!r}, base_url={self.base_url!r})"
+
     @property
     def provider_name(self) -> str:
         return "anthropic"
-    
+
     @property
     def supports_vision(self) -> bool:
         return "claude-3" in self.model
-    
+
     async def _get_client(self) -> Any:
         if self._client is None:
             try:
                 from anthropic import AsyncAnthropic
             except ImportError:
                 raise ImportError("anthropic package required. Run: pip install anthropic")
-            self._client = AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
+            self._client = AsyncAnthropic(
+                api_key=_get_secret_value(self._api_key),
+                base_url=self.base_url,
+            )
         return self._client
     
     def format_messages(self, messages: list[LLMMessage]) -> tuple[str | None, list[dict]]:

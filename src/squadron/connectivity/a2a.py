@@ -4,16 +4,23 @@ Agent-to-Agent (A2A) Protocol Implementation
 Provides horizontal orchestration between autonomous agents.
 Based on the A2A protocol specification for multi-agent coordination.
 
+Security: Includes authentication and request validation to prevent
+unauthorized access and malformed input attacks.
+
 Key concepts:
 - Agent Cards: JSON manifests advertising agent capabilities
 - Task Lifecycle: State machine for task delegation
 - JSON-RPC 2.0: Communication protocol over HTTP
+- Bearer token authentication
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -23,6 +30,17 @@ from uuid import UUID, uuid4
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+# Security: Maximum sizes for input validation
+MAX_INPUT_SIZE = 1024 * 1024  # 1MB
+MAX_CAPABILITY_LENGTH = 100
+MAX_AGENT_ID_LENGTH = 200
+
+
+class A2ASecurityError(Exception):
+    """Raised when A2A security validation fails."""
+    pass
 
 
 class TaskState(str, Enum):
@@ -257,26 +275,45 @@ class A2AAgent:
         self,
         card: AgentCard,
         http_client: Any | None = None,
+        auth_token: str | None = None,
     ):
         """
         Initialize the A2A agent.
-        
+
         Args:
             card: This agent's card
             http_client: HTTP client for outbound requests
+            auth_token: Bearer token for authenticating incoming requests
+                       If None, generate a secure random token
         """
         self.card = card
         self._http_client = http_client
-        
+
+        # Security: Authentication token for incoming requests
+        # Generate a secure random token if not provided
+        if auth_token is None:
+            self._auth_token = secrets.token_urlsafe(32)
+            logger.info(
+                "Generated A2A auth token",
+                agent_id=card.id,
+                token_preview=self._auth_token[:8] + "...",
+            )
+        else:
+            self._auth_token = auth_token
+
         # Capability handlers
         self._handlers: dict[str, Callable[[A2ATask], Awaitable[dict[str, Any]]]] = {}
-        
+
         # Known agents (discovered via cards)
         self._known_agents: dict[str, AgentCard] = {}
-        
+
         # Active tasks (both incoming and outgoing)
         self._incoming_tasks: dict[UUID, A2ATask] = {}
         self._outgoing_tasks: dict[UUID, A2ATask] = {}
+
+    def get_auth_token(self) -> str:
+        """Get the authentication token for this agent (for sharing with trusted clients)."""
+        return self._auth_token
     
     def capability(
         self,
@@ -486,22 +523,118 @@ class A2AAgent:
         
         return task
     
+    def _validate_request(self, request: dict[str, Any]) -> tuple[bool, str]:
+        """
+        Validate an incoming request for security.
+
+        Args:
+            request: The request to validate
+
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        # Check request size (approximate)
+        request_str = json.dumps(request)
+        if len(request_str) > MAX_INPUT_SIZE:
+            return False, f"Request too large: {len(request_str)} > {MAX_INPUT_SIZE}"
+
+        # Validate JSON-RPC structure
+        if not isinstance(request.get("jsonrpc"), str) or request.get("jsonrpc") != "2.0":
+            return False, "Invalid JSON-RPC version"
+
+        if "method" not in request:
+            return False, "Missing method field"
+
+        method = request.get("method", "")
+        if not isinstance(method, str) or len(method) > 100:
+            return False, "Invalid method field"
+
+        # Validate params
+        params = request.get("params", {})
+        if not isinstance(params, dict):
+            return False, "params must be an object"
+
+        # Validate specific fields
+        capability = params.get("capability", "")
+        if capability and len(capability) > MAX_CAPABILITY_LENGTH:
+            return False, f"Capability name too long: {len(capability)} > {MAX_CAPABILITY_LENGTH}"
+
+        from_agent = params.get("fromAgent", "")
+        if from_agent and len(from_agent) > MAX_AGENT_ID_LENGTH:
+            return False, f"Agent ID too long: {len(from_agent)} > {MAX_AGENT_ID_LENGTH}"
+
+        return True, ""
+
+    def _verify_auth_token(self, token: str | None) -> bool:
+        """
+        Verify an authentication token.
+
+        Args:
+            token: Bearer token to verify
+
+        Returns:
+            True if token is valid
+        """
+        if not self._auth_token:
+            # No auth configured - allow all (not recommended for production)
+            return True
+
+        if not token:
+            return False
+
+        # Constant-time comparison to prevent timing attacks
+        return hmac.compare_digest(token, self._auth_token)
+
     async def handle_task_request(
         self,
         request: dict[str, Any],
+        auth_token: str | None = None,
     ) -> dict[str, Any]:
         """
         Handle an incoming task request (server-side).
-        
+
+        Security: Validates request structure and authenticates the caller.
+
         This is called by your HTTP server when receiving a task.
-        
+
         Args:
             request: JSON-RPC request
-            
+            auth_token: Bearer token from Authorization header
+
         Returns:
             JSON-RPC response
         """
         request_id = request.get("id")
+
+        # Security: Verify authentication
+        if not self._verify_auth_token(auth_token):
+            logger.warning(
+                "A2A authentication failed",
+                has_token=bool(auth_token),
+                request_id=request_id,
+            )
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Authentication required",
+                },
+            }
+
+        # Security: Validate request structure
+        is_valid, error = self._validate_request(request)
+        if not is_valid:
+            logger.warning("A2A request validation failed", error=error)
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32600,
+                    "message": f"Invalid request: {error}",
+                },
+            }
+
         method = request.get("method", "")
         params = request.get("params", {})
         

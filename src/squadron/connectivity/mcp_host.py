@@ -4,13 +4,16 @@ MCP Host Implementation
 The MCP (Model Context Protocol) Host manages connections to MCP servers,
 providing a unified interface for tool discovery and execution.
 
-This is the "USB-C" of AI - any MCP-compliant tool works instantly.
+Security: MCP server commands are validated against an allowlist to prevent
+arbitrary code execution from malicious configuration files.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -26,6 +29,41 @@ from squadron.core.config import MCPConfig
 logger = structlog.get_logger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+# Security: Allowlist of safe MCP server commands
+# Only these executables can be spawned as MCP servers
+ALLOWED_MCP_COMMANDS = frozenset({
+    # Node.js based servers
+    "node", "npx", "npm",
+    # Python based servers
+    "python", "python3", "uvx", "uv",
+    # Official MCP server executables (add more as needed)
+    "mcp-server-filesystem",
+    "mcp-server-git",
+    "mcp-server-github",
+    "mcp-server-postgres",
+    "mcp-server-sqlite",
+    "mcp-server-memory",
+    "mcp-server-fetch",
+    "mcp-server-brave-search",
+    "mcp-server-puppeteer",
+})
+
+# Security: Blocked patterns in MCP server arguments
+BLOCKED_ARG_PATTERNS = frozenset({
+    # Shell execution
+    "bash", "sh", "zsh", "fish",
+    # Dangerous flags
+    "--eval", "-e", "--exec",
+    # Network exfiltration (suspicious)
+    "curl", "wget", "nc", "netcat",
+})
+
+
+class MCPSecurityError(Exception):
+    """Raised when MCP security validation fails."""
+    pass
 
 
 class MCPTransport(str, Enum):
@@ -99,10 +137,12 @@ class MCPPrompt:
 class MCPServer:
     """
     Represents a connection to an MCP server.
-    
+
     Handles spawning the server process and communicating via stdio or SSE.
+
+    Security: Commands are validated against an allowlist before execution.
     """
-    
+
     def __init__(
         self,
         name: str,
@@ -111,10 +151,11 @@ class MCPServer:
         env: dict[str, str] | None = None,
         transport: MCPTransport = MCPTransport.STDIO,
         url: str | None = None,
+        skip_validation: bool = False,
     ):
         """
         Initialize an MCP server connection.
-        
+
         Args:
             name: Unique identifier for this server
             command: Command to spawn the server (for stdio)
@@ -122,6 +163,10 @@ class MCPServer:
             env: Environment variables
             transport: Communication protocol
             url: Server URL (for SSE/HTTP transport)
+            skip_validation: Skip command validation (UNSAFE - for testing only)
+
+        Raises:
+            MCPSecurityError: If command validation fails
         """
         self.name = name
         self.command = command
@@ -129,7 +174,11 @@ class MCPServer:
         self.env = env or {}
         self.transport = transport
         self.url = url
-        
+
+        # Security: Validate command before storing
+        if not skip_validation:
+            self._validate_command()
+
         self._process: subprocess.Popen | None = None
         self._tools: dict[str, MCPTool] = {}
         self._resources: dict[str, MCPResource] = {}
@@ -138,6 +187,71 @@ class MCPServer:
         self._request_id = 0
         self._pending_requests: dict[int, asyncio.Future] = {}
         self._read_task: asyncio.Task | None = None
+
+    def _validate_command(self) -> None:
+        """
+        Validate the server command against security rules.
+
+        Security: Prevents arbitrary code execution from malicious config files.
+
+        Raises:
+            MCPSecurityError: If validation fails
+        """
+        # Extract base command name
+        base_cmd = os.path.basename(self.command)
+
+        # Check against allowlist
+        if base_cmd not in ALLOWED_MCP_COMMANDS:
+            logger.error(
+                "MCP server command not in allowlist",
+                command=self.command,
+                base_cmd=base_cmd,
+                allowed=list(ALLOWED_MCP_COMMANDS)[:10],
+            )
+            raise MCPSecurityError(
+                f"MCP server command '{base_cmd}' is not in the allowlist. "
+                f"Allowed commands: {', '.join(sorted(ALLOWED_MCP_COMMANDS)[:10])}..."
+            )
+
+        # Verify command exists on system
+        cmd_path = shutil.which(self.command)
+        if cmd_path is None:
+            raise MCPSecurityError(
+                f"MCP server command '{self.command}' not found on system"
+            )
+
+        # Check arguments for dangerous patterns
+        for arg in self.args:
+            arg_lower = arg.lower()
+            for blocked in BLOCKED_ARG_PATTERNS:
+                if blocked in arg_lower:
+                    logger.warning(
+                        "Suspicious pattern in MCP server argument",
+                        arg=arg[:100],
+                        pattern=blocked,
+                    )
+                    raise MCPSecurityError(
+                        f"Suspicious pattern '{blocked}' found in MCP server arguments"
+                    )
+
+        # Check environment variables for sensitive data leakage
+        sensitive_env_patterns = {"password", "secret", "key", "token", "credential"}
+        for key in self.env:
+            key_lower = key.lower()
+            for pattern in sensitive_env_patterns:
+                if pattern in key_lower:
+                    logger.warning(
+                        "Sensitive environment variable in MCP config",
+                        key=key,
+                    )
+                    # Don't block, but warn - some servers legitimately need API keys
+                    break
+
+        logger.debug(
+            "MCP server command validated",
+            name=self.name,
+            command=self.command,
+        )
     
     async def connect(self) -> None:
         """Establish connection to the MCP server."""

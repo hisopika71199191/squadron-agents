@@ -3,8 +3,13 @@ Core Agent Implementation
 
 The main Agent class built on LangGraph's Functional API.
 Implements the cyclic Plan → Act → Reflect loop.
+
+Security: Includes rate limiting on tool execution to prevent
+resource exhaustion and data exfiltration attacks.
 """
 
+from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
@@ -24,6 +29,21 @@ from squadron.core.state import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+# Security: Default rate limits for tool execution
+DEFAULT_RATE_LIMITS = {
+    # High-risk tools: stricter limits
+    "run_command": (10, 60),  # 10 calls per 60 seconds
+    "execute_code": (5, 60),
+    "write_file": (20, 60),
+    "delete_file": (5, 60),
+    # Medium-risk tools
+    "read_file": (100, 60),
+    "search": (50, 60),
+    # Default for unspecified tools
+    "_default": (100, 60),  # 100 calls per 60 seconds
+}
 
 
 class Agent:
@@ -78,6 +98,10 @@ class Agent:
                 self._tool_registry[tool.name] = tool
             elif hasattr(tool, "__name__"):
                 self._tool_registry[tool.__name__] = tool
+
+        # Security: Rate limiting state
+        self._rate_limit_history: dict[str, list[datetime]] = defaultdict(list)
+        self._rate_limits = DEFAULT_RATE_LIMITS.copy()
 
         # Build the execution graph
         self._graph = self._build_graph()
@@ -267,12 +291,60 @@ class Agent:
 
         return agent_graph
 
+    def _check_rate_limit(self, tool_name: str) -> tuple[bool, str]:
+        """
+        Check if a tool call is within rate limits.
+
+        Security: Prevents resource exhaustion and exfiltration attacks.
+
+        Returns:
+            Tuple of (is_allowed, error_message)
+        """
+        # Get rate limit for this tool (or default)
+        max_calls, window_seconds = self._rate_limits.get(
+            tool_name, self._rate_limits.get("_default", (100, 60))
+        )
+
+        now = datetime.utcnow()
+        window_start = now - timedelta(seconds=window_seconds)
+
+        # Clean old entries
+        self._rate_limit_history[tool_name] = [
+            t for t in self._rate_limit_history[tool_name] if t > window_start
+        ]
+
+        # Check limit
+        current_count = len(self._rate_limit_history[tool_name])
+        if current_count >= max_calls:
+            logger.warning(
+                "Rate limit exceeded",
+                tool=tool_name,
+                count=current_count,
+                limit=max_calls,
+                window=window_seconds,
+            )
+            return False, f"Rate limit exceeded for '{tool_name}': {current_count}/{max_calls} in {window_seconds}s"
+
+        # Record this call
+        self._rate_limit_history[tool_name].append(now)
+        return True, ""
+
     async def _execute_tool(self, tool_call: ToolCall) -> ToolResult:
-        """Execute a single tool call."""
+        """Execute a single tool call with rate limiting."""
         import time
-        
+
+        # Security: Check rate limit before execution
+        is_allowed, rate_error = self._check_rate_limit(tool_call.tool_name)
+        if not is_allowed:
+            return ToolResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.tool_name,
+                result=None,
+                error=rate_error,
+            )
+
         start_time = time.time()
-        
+
         tool = self._tool_registry.get(tool_call.tool_name)
         if not tool:
             return ToolResult(

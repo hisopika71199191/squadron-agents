@@ -112,22 +112,53 @@ class CodingTools:
         return self.workspace_root / path
     
     def _validate_path(self, path: Path) -> bool:
-        """Validate that a path is safe to access."""
+        """
+        Validate that a path is safe to access.
+
+        Security: Uses proper path containment check to prevent traversal attacks.
+        String prefix matching is vulnerable to paths like /workspace_evil/.
+        """
         try:
             resolved = path.resolve()
             workspace_resolved = self.workspace_root.resolve()
-            
-            # Must be within workspace
-            if not str(resolved).startswith(str(workspace_resolved)):
+
+            # Security: Use Path.is_relative_to() for proper containment check
+            # This correctly handles cases like /workspace vs /workspace_evil
+            try:
+                resolved.relative_to(workspace_resolved)
+            except ValueError:
+                # Path is not within workspace
+                logger.warning(
+                    "Path traversal attempt blocked",
+                    path=str(path),
+                    resolved=str(resolved),
+                    workspace=str(workspace_resolved),
+                )
                 return False
-            
+
+            # Security: Check for symlink escapes
+            # The resolved path should still be within workspace after following symlinks
+            if resolved.is_symlink():
+                real_path = resolved.resolve(strict=True)
+                try:
+                    real_path.relative_to(workspace_resolved)
+                except ValueError:
+                    logger.warning(
+                        "Symlink escape attempt blocked",
+                        symlink=str(resolved),
+                        target=str(real_path),
+                    )
+                    return False
+
             # Check extension if restricted
             if self.allowed_extensions:
                 if path.suffix.lstrip(".") not in self.allowed_extensions:
                     return False
-            
+
             return True
-        except Exception:
+        except (OSError, RuntimeError) as e:
+            # Handle permission errors, too many symlink levels, etc.
+            logger.warning("Path validation failed", path=str(path), error=str(e))
             return False
     
     @mcp_tool(description="Read the contents of a file")

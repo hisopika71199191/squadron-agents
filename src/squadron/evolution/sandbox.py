@@ -2,13 +2,18 @@
 Sandboxed Execution Environment
 
 Provides isolated execution environments for self-improvement experiments.
-Uses Docker containers or subprocess isolation to safely test mutations.
+Uses Docker containers for secure isolation.
+
+Security: By default, refuses to execute code without Docker isolation.
+Subprocess mode is intentionally unsafe and disabled by default.
 
 Key features:
-- Docker-based isolation
+- Docker-based isolation (required by default)
 - Resource limits (CPU, memory, time)
 - File system isolation
 - Network restrictions
+- Capability dropping
+- Non-root execution
 """
 
 from __future__ import annotations
@@ -36,33 +41,49 @@ logger = structlog.get_logger(__name__)
 class SandboxType(str, Enum):
     """Type of sandbox isolation."""
     DOCKER = "docker"
-    SUBPROCESS = "subprocess"
-    NONE = "none"  # For testing only
+    SUBPROCESS = "subprocess"  # UNSAFE - disabled by default
+    NONE = "none"  # For testing only - never use in production
+
+
+class SandboxSecurityError(Exception):
+    """Raised when sandbox security requirements are not met."""
+    pass
 
 
 @dataclass
 class SandboxConfig:
     """Configuration for sandbox execution."""
-    
-    sandbox_type: SandboxType = SandboxType.SUBPROCESS
-    
+
+    # Security: Default to Docker, fail-safe if unavailable
+    sandbox_type: SandboxType = SandboxType.DOCKER
+
+    # Security: Require Docker by default (fail-safe mode)
+    require_docker: bool = True
+    allow_unsafe_subprocess: bool = False  # Must be explicitly enabled
+
     # Docker settings
     docker_image: str = "python:3.11-slim"
     docker_network: str = "none"  # Disable networking by default
-    
+
     # Resource limits
     max_memory_mb: int = 512
     max_cpu_percent: int = 50
     max_execution_seconds: float = 60.0
-    
+    max_pids: int = 100  # Prevent fork bombs
+    max_file_descriptors: int = 100
+
     # File system
     working_dir: str | None = None
     mount_paths: list[tuple[str, str]] = field(default_factory=list)  # (host, container)
-    
+
     # Permissions
     allow_network: bool = False
     allow_write: bool = True
-    
+    read_only_root: bool = True  # Security: Read-only root filesystem
+
+    # Security: Run as non-root user in container
+    container_user: str = "65534:65534"  # nobody:nogroup
+
     @classmethod
     def from_evolution_config(cls, config: EvolutionConfig) -> SandboxConfig:
         """Create from evolution config."""
@@ -118,20 +139,21 @@ class ExecutionResult:
 class Sandbox:
     """
     Sandboxed Execution Environment.
-    
-    Provides isolated execution for testing agent mutations and
-    self-improvement experiments.
-    
+
+    Security: By default, refuses to execute code without Docker isolation.
+    This is a fail-safe design to prevent accidental code execution in
+    unsafe environments.
+
     Example:
         ```python
         sandbox = Sandbox(config=SandboxConfig())
-        
-        # Execute code in sandbox
+
+        # Execute code in sandbox (requires Docker)
         result = await sandbox.execute(
             code="print('Hello, World!')",
             language="python",
         )
-        
+
         # Execute a file
         result = await sandbox.execute_file(
             file_path="test_agent.py",
@@ -139,17 +161,31 @@ class Sandbox:
         )
         ```
     """
-    
+
     def __init__(self, config: SandboxConfig | None = None):
         """
         Initialize the sandbox.
-        
+
         Args:
             config: Sandbox configuration
+
+        Raises:
+            SandboxSecurityError: If Docker is required but not available
         """
         self.config = config or SandboxConfig()
         self._temp_dirs: list[Path] = []
         self._docker_available = self._check_docker()
+
+        # Security: Fail-safe mode - refuse to operate without Docker
+        if self.config.require_docker and not self._docker_available:
+            logger.error(
+                "Docker required but not available",
+                require_docker=self.config.require_docker,
+            )
+            raise SandboxSecurityError(
+                "Docker is required for secure sandbox execution but is not available. "
+                "Install Docker or set require_docker=False (UNSAFE) in SandboxConfig."
+            )
     
     def _check_docker(self) -> bool:
         """Check if Docker is available."""
@@ -208,12 +244,30 @@ class Sandbox:
                     error=f"Unsupported language: {language}",
                 )
             
-            # Execute based on sandbox type
+            # Security: Execute based on sandbox type with fail-safe checks
             if self.config.sandbox_type == SandboxType.DOCKER and self._docker_available:
                 result = await self._execute_docker(cmd, temp_dir, timeout, env)
-            else:
+            elif self.config.sandbox_type == SandboxType.SUBPROCESS:
+                # Security: Only allow subprocess if explicitly permitted
+                if not self.config.allow_unsafe_subprocess:
+                    return ExecutionResult(
+                        success=False,
+                        error="Subprocess execution is disabled for security. "
+                        "Set allow_unsafe_subprocess=True to enable (UNSAFE).",
+                    )
+                logger.warning(
+                    "Executing in UNSAFE subprocess mode - no isolation!",
+                    code_length=len(code),
+                )
                 result = await self._execute_subprocess(cmd, temp_dir, timeout, env)
-            
+            else:
+                # No Docker and no subprocess allowed - fail safe
+                return ExecutionResult(
+                    success=False,
+                    error="No secure execution environment available. "
+                    "Docker is required but not available.",
+                )
+
             return result
             
         finally:
@@ -345,33 +399,79 @@ class Sandbox:
         timeout: float,
         env: dict[str, str] | None,
     ) -> ExecutionResult:
-        """Execute using Docker isolation."""
+        """
+        Execute using Docker isolation with hardened security.
+
+        Security features:
+        - Drop all capabilities
+        - Run as non-root user
+        - Read-only root filesystem
+        - Process and file descriptor limits
+        - No new privileges
+        - Restricted network
+        """
         result = ExecutionResult()
         result.started_at = datetime.utcnow()
-        
-        # Build docker command
+
+        # Build docker command with security hardening
         docker_cmd = [
             "docker", "run",
             "--rm",  # Remove container after execution
+
+            # Resource limits
             f"--memory={self.config.max_memory_mb}m",
             f"--cpus={self.config.max_cpu_percent / 100}",
+            f"--pids-limit={self.config.max_pids}",
+            f"--ulimit=nofile={self.config.max_file_descriptors}:{self.config.max_file_descriptors}",
+
+            # Security: Drop all capabilities
+            "--cap-drop=ALL",
+
+            # Security: Prevent privilege escalation
+            "--security-opt=no-new-privileges:true",
+
+            # Security: Run as non-root user
+            f"--user={self.config.container_user}",
+
+            # Security: Network isolation
             f"--network={self.config.docker_network if not self.config.allow_network else 'bridge'}",
+        ]
+
+        # Security: Read-only root filesystem (with tmpfs for /tmp)
+        if self.config.read_only_root:
+            docker_cmd.extend([
+                "--read-only",
+                "--tmpfs=/tmp:rw,noexec,nosuid,size=64m",
+            ])
+
+        # Mount working directory
+        docker_cmd.extend([
             "-v", f"{working_dir}:/workspace:{'rw' if self.config.allow_write else 'ro'}",
             "-w", "/workspace",
-        ]
-        
-        # Add environment variables
+        ])
+
+        # Add environment variables (filter sensitive ones)
         if env:
+            # Security: Don't pass potentially sensitive environment variables
+            safe_env_prefixes = ("LANG", "LC_", "TZ", "PATH")
             for key, value in env.items():
-                docker_cmd.extend(["-e", f"{key}={value}"])
-        
-        # Add mount paths
+                if key.startswith(safe_env_prefixes) or key in {"HOME", "USER"}:
+                    docker_cmd.extend(["-e", f"{key}={value}"])
+
+        # Add mount paths (read-only only)
         for host_path, container_path in self.config.mount_paths:
+            # Security: All additional mounts are read-only
             docker_cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
-        
+
         # Add image and command
         docker_cmd.append(self.config.docker_image)
         docker_cmd.extend(cmd)
+
+        logger.debug(
+            "Executing in hardened Docker container",
+            image=self.config.docker_image,
+            user=self.config.container_user,
+        )
         
         try:
             process = await asyncio.create_subprocess_exec(
