@@ -397,17 +397,6 @@ Squadron builds on the shoulders of giants:
 - [DeepEval](https://github.com/confident-ai/deepeval) - LLM evaluation
 - [MCP](https://modelcontextprotocol.io/) - Model Context Protocol
 
-## Citation
-
-If you use Squadron in your research, please cite:
-
-```bibtex
-@software{squadron2024,
-  title = {Squadron: Inference-Time Compute Agent Framework},
-  year = {2024},
-  url = {https://github.com/squadron-ai/squadron}
-}
-```
 
 ## License
 
@@ -419,6 +408,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 **[⬆ Back to Top](#-squadron-agent-framework)**
 
-Made with ❤️ by the Squadron team
 
 </div>
