@@ -87,6 +87,7 @@ def run(
         config=config.reasoning,
         memory=memory,
         default_tool="echo" if toolpack == "general" else "list_directory",
+        tool_args_fn=lambda state: {"text": state.task} if toolpack == "general" else {"path": "."},
     )
     
     # Create agent

@@ -85,13 +85,27 @@ class GraphitiMemory:
             try:
                 from graphiti_core import Graphiti
                 from graphiti_core.nodes import EpisodeType
+                import os
                 
-                self._graphiti_client = Graphiti(
+                # Ensure OPENAI_API_KEY is set for Graphiti
+                if "OPENAI_API_KEY" not in os.environ and hasattr(self.config, "openai_api_key") and self.config.openai_api_key:
+                    os.environ["OPENAI_API_KEY"] = self.config.openai_api_key.get_secret_value()
+                
+                if not self.config.neo4j_password:
+                    logger.info("NEO4J_PASSWORD not set, using in-memory storage")
+                    self._graphiti_client = None
+                    self._initialized = True
+                    return
+                
+                password = self.config.neo4j_password.get_secret_value()
+                
+                client = Graphiti(
                     uri=self.config.neo4j_uri,
                     user=self.config.neo4j_user,
-                    password=self.config.neo4j_password.get_secret_value(),
+                    password=password,
                 )
-                await self._graphiti_client.build_indices_and_constraints()
+                await client.build_indices_and_constraints()
+                self._graphiti_client = client
                 logger.info("Graphiti client initialized", uri=self.config.neo4j_uri)
             except ImportError:
                 logger.warning(
@@ -99,6 +113,7 @@ class GraphitiMemory:
                     hint="Install graphiti-core for persistent storage",
                 )
             except Exception as e:
+                self._graphiti_client = None
                 logger.warning(
                     "Failed to connect to Neo4j, using in-memory storage",
                     error=str(e),

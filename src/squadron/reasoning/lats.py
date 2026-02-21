@@ -455,7 +455,18 @@ class LATSReasoner:
         if not self.default_tool:
             return []
 
-        args = self.tool_args_fn(state) if self.tool_args_fn else {"text": state.task}
+        if self.tool_args_fn:
+            args = self.tool_args_fn(state)
+        else:
+            # Try to infer argument name based on default_tool
+            if self.default_tool in ("read_file", "write_file", "edit_file"):
+                args = {"path": state.task}
+            elif self.default_tool == "list_dir":
+                args = {"path": "."}
+            elif self.default_tool in ("grep", "find_files"):
+                args = {"pattern": state.task}
+            else:
+                args = {"text": state.task}
 
         yield CandidatePlan(
             id=uuid4(),

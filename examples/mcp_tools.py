@@ -214,6 +214,7 @@ async def example_agent_with_mcp():
         config=config.reasoning,
         memory=memory,
         default_tool="list_directory",
+        tool_args_fn=lambda state: {"path": "."},
     )
     
     # Create agent

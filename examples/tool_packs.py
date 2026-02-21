@@ -219,6 +219,7 @@ async def example_agent_with_tool_packs():
             config=config.reasoning,
             memory=memory,
             default_tool="read_file",
+            tool_args_fn=lambda state: {"path": "README.md"},
         )
         
         agent = Agent(

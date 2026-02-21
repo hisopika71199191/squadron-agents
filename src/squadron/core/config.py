@@ -97,6 +97,11 @@ class MemoryConfig(BaseSettings):
         default=1536,
         description="Embedding dimension",
     )
+    openai_api_key: SecretStr | None = Field(
+        default=None,
+        alias="OPENAI_API_KEY",
+        description="OpenAI API key for Graphiti LLM operations",
+    )
 
     def validate_credentials(self) -> None:
         """Validate that required credentials are configured."""

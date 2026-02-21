@@ -617,7 +617,8 @@ class Agent:
         
         # Run the graph
         try:
-            final_state = await self._graph(state)
+            config = {"configurable": {"thread_id": str(state.session_id)}}
+            final_state = await self._graph.ainvoke(state, config)
             logger.info(
                 "Agent run completed",
                 phase=final_state.phase,
@@ -703,7 +704,7 @@ class Agent:
 
             # Continue execution from the current state
             logger.info("Continuing execution from checkpoint")
-            final_state = await self._graph(state)
+            final_state = await self._graph.ainvoke(state, config)
 
             logger.info(
                 "Resume completed",
