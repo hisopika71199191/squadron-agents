@@ -10,10 +10,11 @@ resource exhaustion and data exfiltration attacks.
 Enhanced with LLM-based task completion detection for accurate evaluation.
 """
 
+import inspect
 import json
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Callable, get_args, get_origin
 from uuid import UUID, uuid4
 
 import structlog
@@ -107,7 +108,7 @@ class Agent:
         llm: LLMProvider | None = None,
         memory: Any | None = None,  # GraphitiMemory
         reasoner: Any | None = None,  # LATSReasoner
-        tools: list[Any] | None = None,
+        tools: list[Any] | Any | None = None,
         checkpointer: Any | None = None,
         completion_confidence_threshold: float = 0.7,
     ):
@@ -120,7 +121,8 @@ class Agent:
             llm: LLM provider for completion detection and other evaluations
             memory: Memory system (Graphiti)
             reasoner: Reasoning engine (LATS)
-            tools: Available tools
+            tools: Available tools — a list of callables, a single tool pack
+                (object with ``get_tools()``), or a list mixing both
             checkpointer: LangGraph checkpointer for persistence
             completion_confidence_threshold: Minimum confidence for LLM completion detection
         """
@@ -129,9 +131,11 @@ class Agent:
         self.llm = llm
         self.memory = memory
         self.reasoner = reasoner
-        self.tools = tools or []
         self.checkpointer = checkpointer or MemorySaver()
         self.completion_confidence_threshold = completion_confidence_threshold
+
+        # Normalize tools: accept a single tool pack, a list of tools/packs, or None
+        self.tools = self._normalize_tools(tools)
 
         # Tool registry for quick lookup
         self._tool_registry: dict[str, Callable] = {}
@@ -145,6 +149,13 @@ class Agent:
         self._rate_limit_history: dict[str, list[datetime]] = defaultdict(list)
         self._rate_limits = DEFAULT_RATE_LIMITS.copy()
 
+        # Bridge tools → reasoner: convert callables to ToolDefinitions
+        # so the LATS reasoner can include them in LLM prompts.
+        if self.reasoner and hasattr(self.reasoner, "register_tools"):
+            tool_defs = self._build_tool_definitions()
+            if tool_defs:
+                self.reasoner.register_tools(tool_defs)
+
         # Build the execution graph
         self._graph = self._build_graph()
 
@@ -154,6 +165,155 @@ class Agent:
             tools=list(self._tool_registry.keys()),
             has_llm=self.llm is not None,
         )
+
+    @staticmethod
+    def _normalize_tools(tools: Any) -> list[Any]:
+        """
+        Normalize the tools parameter into a flat list of callables.
+
+        Handles:
+        - None → empty list
+        - A single tool pack (object with ``get_tools()``) → its tools list
+        - A single callable → wrapped in a list
+        - A list that may contain a mix of callables and tool packs
+        """
+        if tools is None:
+            return []
+
+        # Single tool pack passed directly (not wrapped in a list)
+        if not isinstance(tools, (list, tuple)):
+            if hasattr(tools, "get_tools"):
+                return tools.get_tools()
+            # Single callable
+            return [tools]
+
+        # List/tuple – expand any embedded tool packs
+        expanded: list[Any] = []
+        for item in tools:
+            if hasattr(item, "get_tools"):
+                expanded.extend(item.get_tools())
+            else:
+                expanded.append(item)
+        return expanded
+
+    # ------------------------------------------------------------------
+    # Tool → ToolDefinition conversion
+    # ------------------------------------------------------------------
+    def _build_tool_definitions(self) -> list[Any]:
+        """
+        Convert registered callable tools into ``ToolDefinition`` objects.
+
+        Inspects each tool's signature, docstring, and ``@mcp_tool``
+        metadata (if present) so the LATS reasoner can present them to
+        the LLM when generating candidate actions.
+        """
+        from squadron.llm.base import ToolDefinition
+
+        definitions: list[ToolDefinition] = []
+        for name, tool in self._tool_registry.items():
+            # Description: prefer @mcp_tool metadata, then docstring
+            desc = (
+                getattr(tool, "_mcp_description", None)
+                or (tool.__doc__ or "").strip()
+                or f"Tool {name}"
+            )
+            # Truncate overly long docstrings
+            if len(desc) > 500:
+                desc = desc[:497] + "..."
+
+            params = self._extract_parameters_schema(tool)
+            definitions.append(ToolDefinition(
+                name=name,
+                description=desc,
+                parameters=params,
+            ))
+        return definitions
+
+    @staticmethod
+    def _python_type_to_json_schema(annotation: Any) -> dict[str, Any]:
+        """Map a Python type annotation to a JSON-Schema type descriptor."""
+        if annotation is inspect.Parameter.empty or annotation is Any:
+            return {"type": "string"}
+
+        origin = get_origin(annotation)
+
+        # Handle Optional / Union with None  (e.g. str | None)
+        if origin is type(int | str):  # types.UnionType (Python 3.10+)
+            args = get_args(annotation)
+            non_none = [a for a in args if a is not type(None)]
+            if len(non_none) == 1:
+                return Agent._python_type_to_json_schema(non_none[0])
+            return {"type": "string"}
+
+        # typing.Union  (Python < 3.10 style)
+        try:
+            import typing
+            if origin is typing.Union:
+                args = get_args(annotation)
+                non_none = [a for a in args if a is not type(None)]
+                if len(non_none) == 1:
+                    return Agent._python_type_to_json_schema(non_none[0])
+                return {"type": "string"}
+        except Exception:
+            pass
+
+        # list[...]
+        if origin is list:
+            inner_args = get_args(annotation)
+            items = (
+                Agent._python_type_to_json_schema(inner_args[0])
+                if inner_args
+                else {"type": "string"}
+            )
+            return {"type": "array", "items": items}
+
+        # dict[...]
+        if origin is dict:
+            return {"type": "object"}
+
+        # Primitive types
+        _PRIM_MAP: dict[type, str] = {
+            str: "string",
+            int: "integer",
+            float: "number",
+            bool: "boolean",
+        }
+        schema_type = _PRIM_MAP.get(annotation)  # type: ignore[arg-type]
+        if schema_type:
+            return {"type": schema_type}
+
+        return {"type": "string"}
+
+    @staticmethod
+    def _extract_parameters_schema(func: Callable) -> dict[str, Any]:
+        """
+        Build a JSON-Schema ``parameters`` object from a callable's
+        signature (skipping ``self``).
+        """
+        try:
+            sig = inspect.signature(func)
+        except (ValueError, TypeError):
+            return {"type": "object", "properties": {}}
+
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+
+        for pname, param in sig.parameters.items():
+            if pname == "self":
+                continue
+            prop = Agent._python_type_to_json_schema(param.annotation)
+            properties[pname] = prop
+
+            if param.default is inspect.Parameter.empty:
+                required.append(pname)
+
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            schema["required"] = required
+        return schema
 
     def _build_graph(self) -> Any:
         """Build the LangGraph execution graph."""
@@ -188,6 +348,42 @@ class Agent:
                 # Use LATS for tree-search planning
                 plan_result = await self.reasoner.plan(state)
                 state = plan_result
+            elif self.llm:
+                # Use LLM to generate a plan and tool calls
+                try:
+                    # Format tools for the LLM
+                    from squadron.llm.base import ToolDefinition
+                    import inspect
+                    
+                    llm_tools = []
+                    for name, tool in self._tool_registry.items():
+                        # Simple tool definition extraction
+                        # In a real implementation, this would use a proper schema generator
+                        desc = tool.__doc__ or f"Tool {name}"
+                        llm_tools.append(ToolDefinition(
+                            name=name,
+                            description=desc,
+                            parameters={"type": "object", "properties": {}}
+                        ))
+                    
+                    # Generate response
+                    response = await self.llm.generate(
+                        messages=state.messages,
+                        tools=llm_tools if llm_tools else None
+                    )
+                    
+                    # Add assistant message
+                    state = state.add_message(response.to_message())
+                    
+                    # Add tool calls to state
+                    if response.tool_calls:
+                        for tc in response.tool_calls:
+                            state = state.add_tool_call(tc)
+                            
+                except Exception as e:
+                    logger.error("LLM generation failed", error=str(e))
+                    state = state.add_error(f"LLM generation failed: {e}")
+                    state = state.set_phase(AgentPhase.ERROR)
             else:
                 # Simple single-shot planning
                 plan_message = Message(
@@ -196,6 +392,10 @@ class Agent:
                     metadata={"phase": "planning"},
                 )
                 state = state.add_message(plan_message)
+                # Without an LLM or reasoner, we can't generate tool calls
+                # Mark as error to prevent infinite loop
+                state = state.add_error("No LLM or reasoner available to generate plan")
+                state = state.set_phase(AgentPhase.ERROR)
             
             return state
 
@@ -213,7 +413,11 @@ class Agent:
             
             # Check for pending tool calls
             if not state.pending_tool_calls:
-                logger.debug("No pending tool calls")
+                logger.warning(
+                    "No pending tool calls in action phase – planning "
+                    "did not produce any executable actions",
+                    iteration=state.iteration,
+                )
                 return state
             
             # Process each tool call
@@ -314,8 +518,15 @@ class Agent:
             Main agent execution graph.
             
             Implements the cyclic Plan → Act → Reflect loop.
+            Includes stall detection to prevent spinning when no
+            tool calls are being generated.
             """
+            consecutive_no_ops = 0
+            max_no_ops = 3  # bail after 3 consecutive cycles with no tool execution
+
             while state.should_continue:
+                tool_results_before = len(state.tool_results)
+
                 if state.phase in (AgentPhase.PLANNING, AgentPhase.REFLECTING):
                     state = await plan(state)
                     if not state.should_continue:
@@ -329,6 +540,34 @@ class Agent:
                     if not state.should_continue:
                         break
                     state = await reflect(state)
+
+                # Stall detection: if no new tool results were produced in
+                # this full plan→act→reflect cycle, the agent is stuck.
+                tool_results_after = len(state.tool_results)
+                if tool_results_after == tool_results_before:
+                    consecutive_no_ops += 1
+                    logger.warning(
+                        "No tool calls executed this iteration",
+                        consecutive_no_ops=consecutive_no_ops,
+                        max_no_ops=max_no_ops,
+                        iteration=state.iteration,
+                    )
+                    if consecutive_no_ops >= max_no_ops:
+                        logger.error(
+                            "Agent stalled – no progress for %d consecutive "
+                            "iterations, terminating",
+                            max_no_ops,
+                        )
+                        state = state.add_error(
+                            f"Agent stalled: no tool calls executed for "
+                            f"{consecutive_no_ops} consecutive iterations. "
+                            f"Check that tools are registered and the LLM "
+                            f"is generating valid tool call names."
+                        )
+                        state = state.set_phase(AgentPhase.ERROR)
+                        break
+                else:
+                    consecutive_no_ops = 0
             
             return state
 
@@ -549,25 +788,55 @@ class Agent:
         """
         Fallback heuristic-based completion detection.
 
-        Uses keyword matching when LLM is not available.
+        Uses word-boundary keyword matching so that words like
+        "successfully" do not falsely trigger the "success" keyword.
+        Requires at least 3 successful tool results before considering
+        keyword-based completion, to avoid stopping after the very first
+        write_file or similar preparatory step.
         """
-        # Check if we have any successful tool results
+        import re as _re
+
+        # Need at least one successful tool result
         if not state.tool_results:
             return False
 
-        # Check recent messages for completion indicators
-        recent_messages = state.messages[-3:] if state.messages else []
-        completion_keywords = ["complete", "done", "finished", "success", "completed"]
+        successful_results = [r for r in state.tool_results if r.success]
 
-        for msg in recent_messages:
-            if any(kw in msg.content.lower() for kw in completion_keywords):
-                return True
+        # Only consider keyword-based completion if we have made meaningful
+        # progress (≥3 successful tool calls).  This prevents stopping after
+        # just writing a script file before it has been executed.
+        # NOTE: Only check ASSISTANT messages, not TOOL messages — TOOL
+        # messages often contain 'success': True in JSON output and would
+        # cause false positives.
+        if len(successful_results) >= 3:
+            recent_messages = [
+                m for m in (state.messages[-6:] if state.messages else [])
+                if m.role.value == "assistant"
+            ]
+            # Use word-boundary matching to avoid "successfully" matching "success"
+            completion_keywords = [
+                r"\bcomplete\b", r"\bdone\b", r"\bfinished\b",
+                r"\bsuccess\b", r"\bcompleted\b",
+            ]
+            for msg in recent_messages:
+                text = msg.content.lower()
+                if any(_re.search(kw, text) for kw in completion_keywords):
+                    return True
 
-        # Check if all recent tool calls succeeded
-        recent_results = state.tool_results[-3:] if len(state.tool_results) >= 3 else state.tool_results
-        if all(r.success for r in recent_results):
-            # Multiple successful tool calls might indicate completion
-            if len(recent_results) >= 2:
+        # Only return True when a tool that explicitly produces the final
+        # artefact (run_command / write_file) confirms delivery.
+        # We do NOT use a raw "≥N successes" fallback because research-heavy
+        # tasks (web_search, read_url loops) easily accumulate 5+ successes
+        # without ever producing the requested output file.
+        run_results = [
+            r for r in state.tool_results
+            if r.tool_name in ("run_command", "write_file") and r.success
+        ]
+        if run_results:
+            last_run = run_results[-1]
+            result_text = str(last_run.result or "").lower()
+            # pptxgenjs prints "Presentation saved: <filename>.pptx"
+            if ".pptx" in result_text or "presentation saved" in result_text:
                 return True
 
         return False
@@ -812,7 +1081,7 @@ class Agent:
         return state.awaiting_human_approval
 
     def register_tool(self, tool: Any) -> None:
-        """Register a new tool with the agent."""
+        """Register a new tool with the agent and sync with the reasoner."""
         if hasattr(tool, "name"):
             name = tool.name
         elif hasattr(tool, "__name__"):
@@ -822,6 +1091,9 @@ class Agent:
         
         self._tool_registry[name] = tool
         self.tools.append(tool)
+
+        # Keep reasoner's tool list in sync
+        self._sync_tools_to_reasoner()
         logger.info("Tool registered", tool=name)
 
     def get_tool(self, name: str) -> Any | None:
@@ -882,7 +1154,28 @@ class Agent:
         
         tools = tool_pack.get_tools()
         for tool in tools:
-            self.register_tool(tool)
-        
+            # Use low-level registration (skip per-tool sync)
+            if hasattr(tool, "name"):
+                name = tool.name
+            elif hasattr(tool, "__name__"):
+                name = tool.__name__
+            else:
+                continue
+            self._tool_registry[name] = tool
+            self.tools.append(tool)
+
+        # Sync once after all tools are added
+        self._sync_tools_to_reasoner()
+
         logger.info("Registered tool pack", tools=len(tools))
         return len(tools)
+
+    # ------------------------------------------------------------------
+    # Reasoner synchronisation helper
+    # ------------------------------------------------------------------
+    def _sync_tools_to_reasoner(self) -> None:
+        """Push the current set of ``ToolDefinition``s to the reasoner."""
+        if self.reasoner and hasattr(self.reasoner, "register_tools"):
+            tool_defs = self._build_tool_definitions()
+            if tool_defs:
+                self.reasoner.register_tools(tool_defs)

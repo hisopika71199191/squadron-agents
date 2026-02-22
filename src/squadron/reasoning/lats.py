@@ -18,7 +18,7 @@ from uuid import uuid4
 
 import structlog
 
-from squadron.core.state import AgentState, Message, MessageRole, ToolCall
+from squadron.core.state import AgentPhase, AgentState, Message, MessageRole, ToolCall
 from squadron.reasoning.mcts import MCTSController
 from squadron.reasoning.verifier import ListWiseVerifier, CandidatePlan
 from squadron.core.config import ReasoningConfig
@@ -124,12 +124,15 @@ class LATSReasoner:
         self.llm = llm
         self.tools = tools or []
         self.memory = memory
-        self.verifier = verifier or ListWiseVerifier(config=self.config)
+        self.verifier = verifier or ListWiseVerifier(config=self.config, llm=llm)
         self.default_tool = default_tool
         # Function to derive tool arguments from state; falls back to {"text": task}
         self.tool_args_fn = tool_args_fn
         # Agent Skills support
         self.skills_manager = skills_manager
+
+        # Stall detection: track consecutive iterations with no candidates
+        self._consecutive_empty_plans = 0
 
         # Placeholder MCTS controller – ready for richer policies later
         self.mcts = MCTSController(
@@ -153,13 +156,51 @@ class LATSReasoner:
             candidates = list(self._generate_candidate_calls(state))
 
         if not candidates:
-            # Nothing to do – emit a planning message so the loop can reflect
+            self._consecutive_empty_plans += 1
+            max_empty = self.config.max_empty_plans
+
+            logger.warning(
+                "LATS produced no candidate actions",
+                consecutive_empty=self._consecutive_empty_plans,
+                max_allowed=max_empty,
+                has_llm=self.llm is not None,
+                num_tools=len(self.tools),
+                has_default_tool=self.default_tool is not None,
+            )
+
+            if self._consecutive_empty_plans >= max_empty:
+                # Stall detected – break the loop by signalling an error
+                error_detail = (
+                    f"LATS failed to generate any candidate actions for "
+                    f"{self._consecutive_empty_plans} consecutive iterations. "
+                    f"Possible causes: LLM not returning valid tool calls, "
+                    f"no tools registered, or tool name mismatch between "
+                    f"LLM output and registered tools "
+                    f"({[t.name for t in self.tools]})."
+                )
+                logger.error("LATS stall detected – aborting", detail=error_detail)
+                from squadron.core.state import AgentPhase
+                state = state.add_message(Message(
+                    role=MessageRole.ASSISTANT,
+                    content=error_detail,
+                    metadata={"phase": "planning", "stall": True},
+                ))
+                state = state.add_error(error_detail)
+                return state.set_phase(AgentPhase.ERROR)
+
+            # Not yet at the limit – emit a message and let the loop try again
             msg = Message(
                 role=MessageRole.ASSISTANT,
-                content=f"No tools available for task: {state.task}",
-                metadata={"phase": "planning"},
+                content=(
+                    f"No candidate actions generated for task: {state.task} "
+                    f"(attempt {self._consecutive_empty_plans}/{max_empty})"
+                ),
+                metadata={"phase": "planning", "empty_plan": True},
             )
             return state.add_message(msg)
+
+        # Successful candidate generation – reset stall counter
+        self._consecutive_empty_plans = 0
 
         logger.info(
             "Generated candidate actions",
@@ -239,8 +280,8 @@ class LATSReasoner:
         # Format memory context
         context_text = self._format_context(state.memory_context)
 
-        # Format skills context (if available)
-        skills_text = self._format_skills_for_prompt(state.task)
+        # Format skills context (if available) — async so skills are fully loaded
+        skills_text = await self._format_skills_for_prompt(state.task)
 
         # Build the prompt
         prompt = ACTION_GENERATION_PROMPT.format(
@@ -329,48 +370,105 @@ class LATSReasoner:
 
         return "\n".join(lines)
 
-    def _format_skills_for_prompt(self, task: str) -> str:
+    async def _format_skills_for_prompt(self, task: str, max_chars: int = 20000) -> str:
         """
         Format relevant Agent Skills for inclusion in the prompt.
-        
-        Uses progressive disclosure - only includes skills relevant to the task.
+
+        Includes the SKILL.md body **and** the content of any ``.md``
+        resource files in the skill directory (e.g. ``pptxgenjs.md``,
+        ``editing.md``) so the LLM receives the concrete API reference
+        it needs, not just a pointer to an external file.
+
+        Args:
+            task: The current task description.
+            max_chars: Maximum total characters of skill + resource content
+                to include.  Default 20000 gives the LLM the full guides.
+                Ensure ``max_tokens`` on your LLM is ≥8192.
         """
         if not self.skills_manager:
             return ""
-        
+
         try:
-            # Find skills relevant to the task
-            matches = self.skills_manager.find_skills(task, threshold=0.2)
-            
+            matches = self.skills_manager.find_skills(task, threshold=0.1)
+
             if not matches:
                 return ""
-            
+
             lines = ["\n## Relevant Skills"]
             lines.append("The following skills may help with this task:\n")
-            
+
+            chars_used = 0
+
             for match in matches:
                 skill = match.skill
+
+                # Eagerly load the full skill (Level 2) if not yet loaded.
+                if not skill.is_loaded:
+                    loaded = await self.skills_manager.load_skill(skill.name)
+                    if loaded:
+                        skill = loaded
+
                 lines.append(f"### {skill.name}")
                 lines.append(f"**Description**: {skill.description}")
-                
-                # Include instructions if skill is loaded
+
+                # ── Include SKILL.md instructions ─────────────────────────
                 if skill.is_loaded and skill.instructions:
-                    # Truncate long instructions
-                    instructions = skill.instructions[:1000]
-                    if len(skill.instructions) > 1000:
+                    instructions = skill.instructions
+                    remaining = max_chars - chars_used
+                    if len(instructions) > remaining:
+                        instructions = instructions[:remaining]
                         instructions += "\n... (truncated)"
                     lines.append(f"\n**Instructions**:\n{instructions}")
-                
+                    chars_used += len(instructions)
+
+                # ── Include referenced .md resource files ─────────────────
+                # The SKILL.md often says "Read pptxgenjs.md for details"
+                # but the LLM has no tool call to read files at planning time.
+                # We proactively embed those resource files so the LLM has
+                # the full API reference in its context.
+                if skill.is_loaded and chars_used < max_chars:
+                    try:
+                        resource_paths = [
+                            p for p in skill.get_resource_paths()
+                            if (
+                                p.suffix == ".md"
+                                and p.name != "SKILL.md"
+                                and "schema" not in str(p)
+                                and "schemas" not in str(p)
+                            )
+                        ]
+                        for res_path in resource_paths:
+                            if chars_used >= max_chars:
+                                break
+                            rel = str(res_path.relative_to(skill.path))
+                            content = await self.skills_manager.load_skill_resource(
+                                skill.name, rel
+                            )
+                            if content:
+                                remaining = max_chars - chars_used
+                                if len(content) > remaining:
+                                    content = content[:remaining]
+                                    content += "\n... (truncated)"
+                                lines.append(f"\n#### {rel}\n{content}")
+                                chars_used += len(content)
+                    except Exception as res_err:
+                        logger.debug(
+                            "Could not load skill resources",
+                            skill=skill.name,
+                            error=str(res_err),
+                        )
+
                 lines.append("")
-            
+
             logger.debug(
                 "Added skills context to prompt",
                 num_skills=len(matches),
                 skills=[m.skill.name for m in matches],
+                chars_used=chars_used,
             )
-            
+
             return "\n".join(lines) + "\n"
-            
+
         except Exception as e:
             logger.warning("Failed to format skills for prompt", error=str(e))
             return ""
@@ -384,40 +482,34 @@ class LATSReasoner:
         )
 
     def _parse_llm_candidates(self, content: str) -> list[CandidatePlan]:
-        """Parse LLM response into CandidatePlan objects."""
+        """
+        Parse LLM response into CandidatePlan objects.
+
+        Robust to partial/truncated JSON caused by max_token limits:
+        if the outer array is invalid, falls back to extracting individual
+        ``{...}`` objects from the response.
+        """
+        import re as _re
+
         candidates = []
+        invalid_tool_count = 0
 
-        # Extract JSON array from response
-        try:
-            # Find JSON array in the response
-            json_start = content.find("[")
-            json_end = content.rfind("]") + 1
+        # Build valid tool names set for validation
+        valid_tools = {tool.name for tool in self.tools}
 
-            if json_start < 0 or json_end <= json_start:
-                logger.warning("No JSON array found in LLM response")
-                return []
-
-            json_str = content[json_start:json_end]
-            parsed = json.loads(json_str)
-
-            if not isinstance(parsed, list):
-                logger.warning("LLM response is not a list")
-                return []
-
-            # Build valid tool names set for validation
-            valid_tools = {tool.name for tool in self.tools}
-
-            for item in parsed:
+        def _candidates_from_items(items: list) -> list[CandidatePlan]:
+            result = []
+            nonlocal invalid_tool_count
+            for item in items:
                 if not isinstance(item, dict):
                     continue
-
                 tool_name = item.get("tool_name", "")
                 thought = item.get("thought", "")
                 arguments = item.get("arguments", {})
                 expected_outcome = item.get("expected_outcome", "")
 
-                # Validate tool name
                 if tool_name not in valid_tools:
+                    invalid_tool_count += 1
                     logger.warning(
                         "LLM suggested invalid tool",
                         tool=tool_name,
@@ -425,11 +517,10 @@ class LATSReasoner:
                     )
                     continue
 
-                # Ensure arguments is a dict
                 if not isinstance(arguments, dict):
                     arguments = {}
 
-                candidates.append(
+                result.append(
                     CandidatePlan(
                         id=uuid4(),
                         thought=thought or f"Use {tool_name}",
@@ -438,10 +529,70 @@ class LATSReasoner:
                         context={"arguments": arguments},
                     )
                 )
+            return result
 
-        except json.JSONDecodeError as e:
-            logger.warning("Failed to parse LLM JSON response", error=str(e))
-            return []
+        # ── Strategy 1: try to parse the full JSON array ──────────────────
+        json_start = content.find("[")
+        json_end = content.rfind("]") + 1
+
+        if json_start >= 0 and json_end > json_start:
+            try:
+                parsed = json.loads(content[json_start:json_end])
+                if isinstance(parsed, list):
+                    candidates = _candidates_from_items(parsed)
+                    if candidates:
+                        return candidates
+            except json.JSONDecodeError:
+                pass  # Fall through to partial-JSON recovery
+
+        # ── Strategy 2: the array was truncated — extract complete objects ─
+        # Scan for complete {...} blobs that contain "tool_name".
+        # This handles the common case where max_tokens cuts off mid-array.
+        logger.debug(
+            "Full JSON array parse failed; attempting partial object extraction",
+            response_len=len(content),
+        )
+        depth = 0
+        obj_start = -1
+        for i, ch in enumerate(content):
+            if ch == "{":
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and obj_start >= 0:
+                    blob = content[obj_start : i + 1]
+                    try:
+                        obj = json.loads(blob)
+                        if isinstance(obj, dict) and "tool_name" in obj:
+                            extracted = _candidates_from_items([obj])
+                            candidates.extend(extracted)
+                    except json.JSONDecodeError:
+                        pass
+                    obj_start = -1
+
+        if candidates:
+            logger.debug(
+                "Recovered candidates from partial JSON",
+                num_candidates=len(candidates),
+            )
+            return candidates
+
+        # ── Final logging if nothing worked ───────────────────────────────
+        if not candidates:
+            if invalid_tool_count > 0:
+                logger.error(
+                    "All LLM-suggested tools were invalid – none matched "
+                    "registered tools. This is a common cause of agent stalling.",
+                    invalid_count=invalid_tool_count,
+                    valid_tools=list(valid_tools),
+                )
+            else:
+                logger.warning(
+                    "Failed to parse LLM JSON response",
+                    response_preview=content[:300],
+                )
 
         return candidates
 
@@ -484,6 +635,8 @@ class LATSReasoner:
     def set_llm(self, llm: LLMProvider) -> None:
         """Set the LLM provider for action generation."""
         self.llm = llm
+        # Propagate to verifier so ranking also uses the LLM
+        self.verifier.llm = llm
         # Reinitialize MCTS with real functions now that we have an LLM
         self._init_mcts_with_llm()
         logger.info("Set LLM provider for LATS", provider=llm.provider_name)

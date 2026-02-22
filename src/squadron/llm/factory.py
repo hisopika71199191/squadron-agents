@@ -183,7 +183,7 @@ def _get_api_key_for_provider(provider: str) -> str | None:
         "openai": ["OPENAI_API_KEY"],
         "anthropic": ["ANTHROPIC_API_KEY"],
         "huggingface": ["HF_TOKEN", "HUGGINGFACE_API_KEY"],
-        "openai_compatible": ["OPENAI_API_KEY", "API_KEY"],
+        "openai_compatible": ["OPENAI_API_KEY", "API_KEY", "ALI_API_KEY"],
     }
     
     for var in env_vars.get(provider, []):

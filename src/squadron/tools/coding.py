@@ -653,6 +653,85 @@ class CodingTools:
         
         return items
     
+    @mcp_tool(description="Run a shell command in the workspace directory")
+    async def run_command(
+        self,
+        command: str,
+        cwd: str | None = None,
+        timeout: int = 120,
+    ) -> dict[str, Any]:
+        """
+        Run a shell command in the workspace directory.
+
+        Args:
+            command: Shell command to execute (passed to /bin/sh -c)
+            cwd: Working directory for the command (relative to workspace, or absolute)
+            timeout: Maximum seconds to wait for the command to complete
+
+        Returns:
+            Dict with keys: stdout, stderr, returncode, success
+        """
+        import shlex
+
+        # Resolve the working directory
+        if cwd:
+            work_dir = self._resolve_path(cwd)
+            if not self._validate_path(work_dir):
+                raise ValueError(f"Access denied for cwd: {cwd}")
+        else:
+            work_dir = self.workspace_root
+
+        logger.debug("Running command", command=command[:200], cwd=str(work_dir))
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(work_dir),
+            )
+
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                return {
+                    "stdout": "",
+                    "stderr": f"Command timed out after {timeout} seconds",
+                    "returncode": -1,
+                    "success": False,
+                }
+
+            returncode = proc.returncode if proc.returncode is not None else -1
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+            logger.debug(
+                "Command completed",
+                returncode=returncode,
+                stdout_len=len(stdout),
+                stderr_len=len(stderr),
+            )
+
+            return {
+                "stdout": stdout,
+                "stderr": stderr,
+                "returncode": returncode,
+                "success": returncode == 0,
+            }
+
+        except Exception as e:
+            logger.error("Command execution failed", command=command[:200], error=str(e))
+            return {
+                "stdout": "",
+                "stderr": str(e),
+                "returncode": -1,
+                "success": False,
+            }
+
     def get_tools(self) -> list[Callable]:
         """Get all tools as a list of callables."""
         return [
@@ -664,4 +743,5 @@ class CodingTools:
             self.git_status,
             self.git_diff,
             self.list_dir,
+            self.run_command,
         ]

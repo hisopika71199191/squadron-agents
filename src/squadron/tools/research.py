@@ -130,7 +130,12 @@ class ResearchTools:
         if not self.search_api_key:
             logger.warning("No search API key configured")
             return []
-        
+
+        # Coerce to int: LLMs (e.g. qwen3.5-plus via OpenAI-compatible API) may
+        # return numeric tool arguments as float (10.0) or string ("10"), both of
+        # which cause "slice indices must be integers" when used in list[:n].
+        num_results = int(num_results)
+
         if self.search_provider == "serper":
             return await self._search_serper(query, num_results, search_type)
         elif self.search_provider == "tavily":

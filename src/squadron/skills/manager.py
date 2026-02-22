@@ -52,18 +52,25 @@ class SkillsManager:
         workspace_path: str | Path | None = None,
         skills_dirs: list[str] | None = None,
         max_skills_in_context: int = 5,
+        tools_workspace: str | Path | None = None,
     ):
         """
         Initialize the Skills Manager.
-        
+
         Args:
             workspace_path: Root workspace directory to search for skills
             skills_dirs: Custom skills directories to search (relative to workspace)
             max_skills_in_context: Maximum skills to include in LLM context
+            tools_workspace: Working directory used when the skills manager is
+                passed as ``tools=skills`` to an ``Agent``.  Defaults to
+                ``workspace_path`` when not supplied.  Set this to the
+                directory where you want generated files (e.g. ``.pptx``) to
+                land when the agent runs shell commands via ``run_command``.
         """
         self.workspace_path = Path(workspace_path) if workspace_path else Path.cwd()
         self.skills_dirs = skills_dirs or DEFAULT_SKILLS_DIRS
         self.max_skills_in_context = max_skills_in_context
+        self._tools_workspace = Path(tools_workspace) if tools_workspace else None
         
         # Level 1: Metadata index (always loaded)
         self._metadata_index: dict[str, SkillMetadata] = {}
@@ -314,6 +321,54 @@ class SkillsManager:
         """Get metadata for a specific skill."""
         return self._metadata_index.get(skill_name)
     
+    def get_tools(self, workspace_root: str | Path | None = None) -> list:
+        """
+        Return execution tools needed to run skill scripts.
+
+        Skill packages (e.g. the PPTX skill) contain helper scripts that the
+        LLM is instructed to invoke via shell commands (``python scripts/…``,
+        ``node …``, ``npm …``).  Calling ``get_tools()`` on the
+        ``SkillsManager`` exposes a ``run_command``, ``write_file``,
+        ``read_file``, and ``list_dir`` toolset so that both the LLM's
+        skill instructions *and* its execution environment are provided by a
+        single object.
+
+        This lets you simplify the agent setup from::
+
+            coding_tools = CodingTools(workspace_root="…")
+            agent = Agent(…, tools=coding_tools)
+
+        to just::
+
+            skills = SkillsManager(
+                workspace_path="src/squadron",
+                skills_dirs=["skills"],
+                tools_workspace="/path/to/output",   # where .pptx files land
+            )
+            agent = Agent(…, tools=skills)
+
+        Args:
+            workspace_root: Working directory for commands and file operations.
+                Precedence: explicit arg > ``tools_workspace`` constructor param
+                > ``workspace_path``.
+
+        Returns:
+            List of callable tool functions (``run_command``, ``write_file``,
+            ``read_file``, ``list_dir``, ``find_files``, ``edit_file``,
+            ``grep``).
+        """
+        from squadron.tools.coding import CodingTools
+
+        if workspace_root:
+            root = Path(workspace_root)
+        elif self._tools_workspace:
+            root = self._tools_workspace
+        else:
+            root = self.workspace_path
+
+        coding = CodingTools(workspace_root=root)
+        return coding.get_tools()
+
     def clear_cache(self) -> None:
         """Clear the loaded skills cache."""
         self._loaded_skills.clear()

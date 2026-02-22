@@ -12,6 +12,7 @@ from uuid import UUID
 import structlog
 
 from squadron.core.config import ReasoningConfig
+from squadron.llm.base import LLMMessage, LLMProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -72,16 +73,19 @@ class ListWiseVerifier:
         self,
         config: ReasoningConfig | None = None,
         llm_client: Any | None = None,
+        llm: LLMProvider | None = None,
     ):
         """
         Initialize the verifier.
         
         Args:
             config: Reasoning configuration
-            llm_client: LLM client for ranking (optional)
+            llm_client: Legacy LLM client for ranking (optional, kept for backwards-compat)
+            llm: Squadron LLMProvider for ranking (preferred over llm_client)
         """
         self.config = config or ReasoningConfig()
         self.llm_client = llm_client
+        self.llm = llm
         
         # Ranking prompt template
         self._ranking_prompt = """You are an expert plan evaluator. Your task is to rank the following candidate plans for accomplishing a task.
@@ -168,9 +172,11 @@ Your ranking:"""
             plans=plans_text,
         )
         
-        # Get ranking from LLM
-        if self.llm_client:
+        # Get ranking from LLM (prefer native squadron LLM, then legacy llm_client)
+        if self.llm:
             ranking_result = await self._get_llm_ranking(prompt, len(candidates))
+        elif self.llm_client:
+            ranking_result = await self._get_legacy_llm_ranking(prompt, len(candidates))
         else:
             # Fallback to heuristic ranking
             ranking_result = await self._heuristic_ranking(candidates, task)
@@ -215,30 +221,55 @@ Your ranking:"""
         prompt: str,
         num_candidates: int,
     ) -> dict[str, Any]:
-        """Get ranking from LLM."""
+        """Get ranking from the squadron LLMProvider."""
         import json
-        
+
         try:
-            # Call LLM
-            response = await self.llm_client.ainvoke(prompt)
-            
-            # Parse response
-            content = response.content if hasattr(response, "content") else str(response)
-            
-            # Extract JSON from response
+            messages = [LLMMessage.user(prompt)]
+            response = await self.llm.generate(messages)
+            content = response.content or ""
+
+            # Extract JSON object from response
             json_start = content.find("{")
             json_end = content.rfind("}") + 1
-            
+
             if json_start >= 0 and json_end > json_start:
                 json_str = content[json_start:json_end]
                 result = json.loads(json_str)
                 return result
-            
+
             logger.warning("Could not parse LLM ranking response")
             return {"ranking": list(range(1, num_candidates + 1))}
-            
+
         except Exception as e:
             logger.error("LLM ranking failed", error=str(e))
+            return {"ranking": list(range(1, num_candidates + 1))}
+
+    async def _get_legacy_llm_ranking(
+        self,
+        prompt: str,
+        num_candidates: int,
+    ) -> dict[str, Any]:
+        """Get ranking from a legacy LangChain-style llm_client (backwards-compat)."""
+        import json
+
+        try:
+            response = await self.llm_client.ainvoke(prompt)
+            content = response.content if hasattr(response, "content") else str(response)
+
+            json_start = content.find("{")
+            json_end = content.rfind("}") + 1
+
+            if json_start >= 0 and json_end > json_start:
+                json_str = content[json_start:json_end]
+                result = json.loads(json_str)
+                return result
+
+            logger.warning("Could not parse legacy LLM ranking response")
+            return {"ranking": list(range(1, num_candidates + 1))}
+
+        except Exception as e:
+            logger.error("Legacy LLM ranking failed", error=str(e))
             return {"ranking": list(range(1, num_candidates + 1))}
 
     async def _heuristic_ranking(

@@ -625,6 +625,8 @@ class MCPHost:
         
         if not path.exists():
             logger.warning("MCP config file not found", path=str(path))
+            # Don't return early, just log the warning and continue with empty servers
+            # This allows the agent to still function without MCP servers
             return
         
         with open(path) as f:

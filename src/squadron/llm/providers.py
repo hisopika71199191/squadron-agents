@@ -654,14 +654,18 @@ class OpenAICompatibleProvider(LLMProvider):
     def __init__(
         self,
         model: str,
-        base_url: str,
+        base_url: str | None = None,
         api_key: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         **kwargs: Any,
     ):
         super().__init__(model, temperature, max_tokens, **kwargs)
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/") if base_url else ""
+        # Strip trailing /v1 to avoid duplication (/v1/v1/...) since we
+        # always append /v1/chat/completions, /v1/embeddings, etc.
+        if self.base_url.endswith("/v1"):
+            self.base_url = self.base_url[:-3]
         self.api_key = api_key
         self._session: Any = None
     

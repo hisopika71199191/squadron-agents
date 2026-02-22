@@ -50,7 +50,10 @@ from squadron.llm import (
 )
 
 # Tools
-from squadron.tools import CodingTools, ResearchTools, OpsTools
+from squadron.tools import CodingTools, ResearchTools, OpsTools, PresentationTools
+
+# Skills
+from squadron.skills.manager import SkillsManager
 
 __version__ = "0.1.0"
 __all__ = [
@@ -92,6 +95,9 @@ __all__ = [
     "CodingTools",
     "ResearchTools",
     "OpsTools",
+    "PresentationTools",
+    # Skills
+    "SkillsManager",
     # Version
     "__version__",
 ]

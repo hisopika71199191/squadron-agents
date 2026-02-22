@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class LLMConfig(BaseSettings):
     """Configuration for LLM providers."""
 
-    model_config = SettingsConfigDict(env_prefix="LLM_")
+    model_config = SettingsConfigDict(env_prefix="LLM_", env_file=".env", extra="ignore")
 
     provider: Literal["openai", "anthropic", "ollama", "huggingface", "openai_compatible"] = Field(
         default="openai",
@@ -48,6 +48,10 @@ class LLMConfig(BaseSettings):
         default=None,
         alias="HF_TOKEN",
     )
+    ali_api_key: SecretStr | None = Field(
+        default=None,
+        alias="ALI_API_KEY",
+    )
     
     # Custom endpoint (for OpenAI-compatible APIs, vLLM, DigitalOcean, etc.)
     base_url: str | None = Field(
@@ -71,7 +75,11 @@ class LLMConfig(BaseSettings):
 class MemoryConfig(BaseSettings):
     """Configuration for Graphiti memory system."""
 
-    model_config = SettingsConfigDict(env_prefix="MEMORY_")
+    model_config = SettingsConfigDict(
+        env_prefix="MEMORY_",
+        env_file=(".env", "examples/.env"),
+        extra="ignore",
+    )
 
     neo4j_uri: str = Field(
         default="bolt://localhost:7687",
@@ -102,6 +110,31 @@ class MemoryConfig(BaseSettings):
         alias="OPENAI_API_KEY",
         description="OpenAI API key for Graphiti LLM operations",
     )
+    openai_base_url: str | None = Field(
+        default=None,
+        alias="OPENAI_BASE_URL",
+        description="OpenAI base URL for Graphiti LLM operations",
+    )
+    ali_api_key: SecretStr | None = Field(
+        default=None,
+        alias="ALI_API_KEY",
+        description="Alibaba Cloud API key for Graphiti embeddings",
+    )
+    ali_base_url: str | None = Field(
+        default=None,
+        alias="ALI_BASE_URL",
+        description="Alibaba Cloud base URL for Graphiti embeddings",
+    )
+    embed_model: str | None = Field(
+        default=None,
+        alias="EMBED_MODEL",
+        description="Embedding model for Graphiti",
+    )
+    llm_model: str | None = Field(
+        default=None,
+        alias="LLM_MODEL",
+        description="LLM model name for Graphiti entity extraction (e.g. qwen-plus, gpt-4o)",
+    )
 
     def validate_credentials(self) -> None:
         """Validate that required credentials are configured."""
@@ -115,7 +148,7 @@ class MemoryConfig(BaseSettings):
 class ReasoningConfig(BaseSettings):
     """Configuration for LATS reasoning engine."""
 
-    model_config = SettingsConfigDict(env_prefix="REASONING_")
+    model_config = SettingsConfigDict(env_prefix="REASONING_", env_file=".env", extra="ignore")
 
     n_candidates: int = Field(
         default=5,
@@ -138,6 +171,12 @@ class ReasoningConfig(BaseSettings):
         ge=1,
         description="Maximum simulations per decision",
     )
+    max_empty_plans: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Max consecutive empty plans before erroring out (prevents infinite loops)",
+    )
     verifier_model: str = Field(
         default="gpt-4o-mini",
         description="Model for list-wise verification",
@@ -147,7 +186,7 @@ class ReasoningConfig(BaseSettings):
 class MCPConfig(BaseSettings):
     """Configuration for MCP connectivity."""
 
-    model_config = SettingsConfigDict(env_prefix="MCP_")
+    model_config = SettingsConfigDict(env_prefix="MCP_", env_file=".env", extra="ignore")
 
     servers_config_path: str = Field(
         default="mcp_servers.json",
@@ -168,7 +207,7 @@ class MCPConfig(BaseSettings):
 class GovernanceConfig(BaseSettings):
     """Configuration for evaluation and safety."""
 
-    model_config = SettingsConfigDict(env_prefix="GOVERNANCE_")
+    model_config = SettingsConfigDict(env_prefix="GOVERNANCE_", env_file=".env", extra="ignore")
 
     enable_guardrails: bool = Field(
         default=True,
@@ -192,7 +231,7 @@ class GovernanceConfig(BaseSettings):
 class SkillsConfig(BaseSettings):
     """Configuration for Agent Skills support."""
 
-    model_config = SettingsConfigDict(env_prefix="SKILLS_")
+    model_config = SettingsConfigDict(env_prefix="SKILLS_", env_file=".env", extra="ignore")
 
     enabled: bool = Field(
         default=True,
@@ -228,7 +267,7 @@ class SkillsConfig(BaseSettings):
 class EvolutionConfig(BaseSettings):
     """Configuration for self-improvement system."""
 
-    model_config = SettingsConfigDict(env_prefix="EVOLUTION_")
+    model_config = SettingsConfigDict(env_prefix="EVOLUTION_", env_file=".env", extra="ignore")
 
     enable_self_improvement: bool = Field(
         default=False,

@@ -87,10 +87,6 @@ class GraphitiMemory:
                 from graphiti_core.nodes import EpisodeType
                 import os
                 
-                # Ensure OPENAI_API_KEY is set for Graphiti
-                if "OPENAI_API_KEY" not in os.environ and hasattr(self.config, "openai_api_key") and self.config.openai_api_key:
-                    os.environ["OPENAI_API_KEY"] = self.config.openai_api_key.get_secret_value()
-                
                 if not self.config.neo4j_password:
                     logger.info("NEO4J_PASSWORD not set, using in-memory storage")
                     self._graphiti_client = None
@@ -99,12 +95,242 @@ class GraphitiMemory:
                 
                 password = self.config.neo4j_password.get_secret_value()
                 
+                # Resolve API credentials (ALI takes priority over OPENAI env vars)
+                api_key = (
+                    (self.config.ali_api_key.get_secret_value() if self.config.ali_api_key else None)
+                    or os.environ.get("ALI_API_KEY")
+                    or (self.config.openai_api_key.get_secret_value() if self.config.openai_api_key else None)
+                    or os.environ.get("OPENAI_API_KEY")
+                )
+
+                if not api_key:
+                    logger.info(
+                        "No LLM API key configured (ALI_API_KEY / OPENAI_API_KEY not set), "
+                        "using in-memory storage"
+                    )
+                    self._graphiti_client = None
+                    self._initialized = True
+                    return
+
+                base_url = (
+                    (self.config.ali_base_url if self.config.ali_base_url else None)
+                    or os.environ.get("ALI_BASE_URL")
+                    or (self.config.openai_base_url if self.config.openai_base_url else None)
+                    or os.environ.get("OPENAI_BASE_URL")
+                )
+                llm_model = (
+                    self.config.llm_model
+                    or os.environ.get("LLM_MODEL")
+                    or "gpt-4o"
+                )
+                embed_model = (
+                    self.config.embed_model
+                    or os.environ.get("EMBED_MODEL")
+                    or self.config.embedding_model
+                )
+
+                # Configure LLM Client using a patched OpenAIGenericClient that:
+                # 1. Injects "json" into messages when using json_object response format
+                #    (required by some providers like Ali Cloud / Qwen).
+                # 2. Falls back from json_schema to json_object when the provider
+                #    does not support structured outputs, ensuring ExtractedEntities
+                #    and other response models are still validated correctly.
+                # 3. Recursively resolves $ref in the JSON schema hint so that nested
+                #    fields (e.g. ExtractedEntity.name inside ExtractedEntities) are
+                #    shown to the model with their correct field names.
+                from graphiti_core.llm_client import LLMConfig
+                from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+                from graphiti_core.llm_client.config import ModelSize
+                from graphiti_core.prompts.models import Message as GMessage
+                import json as _json
+                import typing as _typing
+                from pydantic import BaseModel as _BaseModel
+
+                class _AliCompatibleClient(OpenAIGenericClient):
+                    """
+                    Drop-in replacement for OpenAIGenericClient that works with
+                    providers (e.g. Ali Cloud / Qwen) that:
+                    - Require the word "json" to appear in the conversation when
+                      response_format={'type': 'json_object'} is requested.
+                    - Do not support response_format={'type': 'json_schema'} and
+                      instead return free-form JSON that may not match field names.
+                    """
+
+                    async def _generate_response(  # type: ignore[override]
+                        self,
+                        messages: list[GMessage],
+                        response_model: type[_BaseModel] | None = None,
+                        max_tokens: int = 4096,
+                        model_size: ModelSize = ModelSize.medium,
+                    ) -> dict[str, _typing.Any]:
+                        import openai as _openai  # local import to mirror parent
+
+                        openai_messages = []
+                        for m in messages:
+                            m.content = self._clean_input(m.content)
+                            if m.role == "user":
+                                openai_messages.append({"role": "user", "content": m.content})
+                            elif m.role == "system":
+                                openai_messages.append({"role": "system", "content": m.content})
+
+                        # Always use json_object format (broadest provider support).
+                        # Inject a JSON-schema hint into the last user message so that:
+                        #   a) Providers that require "json" in messages are satisfied.
+                        #   b) Models without json_schema support still return the
+                        #      correct field names by seeing the expected schema.
+                        response_format: dict[str, _typing.Any] = {"type": "json_object"}
+
+                        if response_model is not None:
+                            schema = response_model.model_json_schema()
+                            defs = schema.get("$defs", {})
+
+                            def _resolve_ref(ref_str: str) -> dict:
+                                """Resolve a $ref like '#/$defs/SomeModel' to its schema dict."""
+                                parts = ref_str.lstrip("#/").split("/")
+                                node: dict = schema
+                                for part in parts:
+                                    node = node.get(part, {})
+                                return node
+
+                            def _describe_props(props: dict, required: list, indent: int = 2) -> list[str]:
+                                """Recursively build hint lines for a properties dict."""
+                                pad = " " * indent
+                                lines: list[str] = []
+                                for field_name, field_info in props.items():
+                                    req_marker = " (required)" if field_name in required else ""
+                                    # Resolve $ref if present
+                                    if "$ref" in field_info:
+                                        ref_schema = _resolve_ref(field_info["$ref"])
+                                        sub_props = ref_schema.get("properties", {})
+                                        sub_required = ref_schema.get("required", [])
+                                        if sub_props:
+                                            lines.append(f'{pad}"{field_name}": object{req_marker} with fields:')
+                                            lines.extend(_describe_props(sub_props, sub_required, indent + 2))
+                                            continue
+                                    # Array whose items are a $ref
+                                    if field_info.get("type") == "array":
+                                        items = field_info.get("items", {})
+                                        if "$ref" in items:
+                                            ref_schema = _resolve_ref(items["$ref"])
+                                            sub_props = ref_schema.get("properties", {})
+                                            sub_required = ref_schema.get("required", [])
+                                            if sub_props:
+                                                lines.append(
+                                                    f'{pad}"{field_name}": array of objects{req_marker}, each with fields:'
+                                                )
+                                                lines.extend(_describe_props(sub_props, sub_required, indent + 2))
+                                                continue
+                                    description = field_info.get("description", field_info.get("type", "value"))
+                                    lines.append(f'{pad}"{field_name}": {description}{req_marker}')
+                                return lines
+
+                            # Build a concise field list so the model knows what to return
+                            props = schema.get("properties", {})
+                            required = schema.get("required", [])
+                            hint_lines = [
+                                "Respond with a JSON object containing exactly these fields:",
+                            ]
+                            hint_lines.extend(_describe_props(props, required))
+                            json_hint = "\n".join(hint_lines)
+                            # Append hint to the last user message
+                            if openai_messages:
+                                openai_messages[-1]["content"] = (
+                                    openai_messages[-1]["content"] + "\n\n" + json_hint
+                                )
+                        else:
+                            # No schema — still ensure "json" appears somewhere so
+                            # json_object mode is accepted by strict providers.
+                            if openai_messages and "json" not in openai_messages[-1]["content"].lower():
+                                openai_messages[-1]["content"] += (
+                                    "\n\nRespond with a valid JSON object."
+                                )
+
+                        try:
+                            response = await self.client.chat.completions.create(
+                                model=self.model or "gpt-4o",
+                                messages=openai_messages,  # type: ignore[arg-type]
+                                temperature=self.temperature,
+                                max_tokens=self.max_tokens,
+                                response_format=response_format,  # type: ignore[arg-type]
+                            )
+                            result = response.choices[0].message.content or "{}"
+                            return _json.loads(result)
+                        except _openai.RateLimitError as e:
+                            from graphiti_core.llm_client.errors import RateLimitError
+                            raise RateLimitError from e
+                        except Exception as e:
+                            logger.error(f"Error in generating LLM response: {e}")
+                            raise
+
+                llm_config = LLMConfig(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=llm_model,
+                )
+                llm_client = _AliCompatibleClient(config=llm_config)
+
+                # Configure Embedder
+                # Use a batching-aware subclass that respects the Ali Cloud
+                # embedding API limit of 10 inputs per request.
+                from graphiti_core.embedder import OpenAIEmbedder, OpenAIEmbedderConfig
+
+                _ALI_EMBED_BATCH_SIZE = 10
+
+                class _BatchedEmbedder(OpenAIEmbedder):
+                    """
+                    OpenAIEmbedder that chunks create_batch() calls to avoid
+                    exceeding the provider's per-request input limit (e.g. Ali Cloud
+                    allows at most 10 texts per embedding API call).
+                    """
+
+                    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
+                        if len(input_data_list) <= _ALI_EMBED_BATCH_SIZE:
+                            return await super().create_batch(input_data_list)
+                        # Process in chunks and concatenate results
+                        all_embeddings: list[list[float]] = []
+                        for i in range(0, len(input_data_list), _ALI_EMBED_BATCH_SIZE):
+                            chunk = input_data_list[i : i + _ALI_EMBED_BATCH_SIZE]
+                            chunk_embeddings = await super().create_batch(chunk)
+                            all_embeddings.extend(chunk_embeddings)
+                        return all_embeddings
+
+                embedder_config = OpenAIEmbedderConfig(
+                    api_key=api_key,
+                    base_url=base_url,
+                    embedding_model=embed_model,
+                )
+                embedder = _BatchedEmbedder(config=embedder_config)
+
+                # Graphiti internally constructs an OpenAIRerankerClient() with no
+                # parameters, which requires OPENAI_API_KEY in the environment.
+                # Satisfy this by injecting the resolved api_key (which may be an
+                # ALI_API_KEY or any other OpenAI-compatible key) as a fallback.
+                os.environ.setdefault("OPENAI_API_KEY", api_key)
+
                 client = Graphiti(
                     uri=self.config.neo4j_uri,
                     user=self.config.neo4j_user,
                     password=password,
+                    llm_client=llm_client,
+                    embedder=embedder,
                 )
                 await client.build_indices_and_constraints()
+
+                # Backfill missing `entity_edges` property on Episodic nodes created
+                # before this schema field was introduced, to suppress Neo4j warning
+                # gql_status='01N52' ("property key does not exist").
+                try:
+                    await client.driver.execute_query(
+                        "MATCH (e:Episodic) WHERE e.entity_edges IS NULL "
+                        "SET e.entity_edges = []",
+                    )
+                    logger.debug("Backfilled entity_edges on legacy Episodic nodes")
+                except Exception as migration_err:
+                    logger.debug(
+                        "entity_edges backfill skipped",
+                        reason=str(migration_err),
+                    )
+
                 self._graphiti_client = client
                 logger.info("Graphiti client initialized", uri=self.config.neo4j_uri)
             except ImportError:
